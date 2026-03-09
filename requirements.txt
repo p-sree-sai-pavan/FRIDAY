@@ -1,0 +1,17 @@
+# FRIDAY Phase 2 — Agent Layer Dependencies
+
+# Browser automation
+playwright>=1.44.0
+
+# HTML parsing
+beautifulsoup4>=4.12.0
+
+# Research (already in your stack)
+tavily-python>=0.3.0
+duckduckgo-search>=6.0.0
+
+# Semantic grading
+# sentence-transformers>=2.7.0
+# torch>=2.0.0
+
+# Note: After installation, run: playwright install chromium

@@ -1,0 +1,9 @@
+.env
+data/memory/
+data/logs/
+workspace/
+__pycache__/
+*.pyc
+*.db
+*.wav
+*.mp3
