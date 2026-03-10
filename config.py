@@ -11,9 +11,10 @@ VERSION = "2.0.0"
 # ========================
 # AI SETTINGS
 # ========================
-PRIMARY_MODEL = "llama-3.3-70b-versatile"
-FAST_MODEL = "llama-3.1-8b-instant"
-VISION_MODEL = "llama4-scout-17b-16e"
+PRIMARY_MODEL  = "llama-3.3-70b-versatile"
+FAST_MODEL     = "llama-3.1-8b-instant"
+TOOLS_MODEL    = "llama3-groq-70b-8192-tool-use-preview"
+VISION_MODEL   = "llama4-scout-17b-16e"
 FALLBACK_MODEL = "gemini-2.5-flash"
 TEMPERATURE = 0.45
 MAX_TOKENS = 1000
@@ -33,8 +34,9 @@ WORKSPACE_PATH = os.path.join(BASE_DIR, "workspace")
 MAX_HISTORY = 10
 MEMORY_COLLECTION = "friday_memory"
 SIMILARITY_THRESHOLD = 0.95
-MIN_RELEVANCE = 0.4
+MIN_RELEVANCE = 0.2
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+SPARSE_MODEL = "Qdrant/bm25"
 CRAG_CORRECT_THRESHOLD = 0.7
 CRAG_AMBIGUOUS_THRESHOLD = 0.4
 MAX_RAG_RETRIES = 2
@@ -64,10 +66,3 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 # ========================
 LOG_LEVEL = "INFO"
 DEBUG = False
-
-# Add ALL of these to config.py in the MEMORY SETTINGS section
-
-SPARSE_MODEL             = "Qdrant/bm25"   # sparse embedding model
-MIN_RELEVANCE            = 0.3             # minimum cosine score to keep a result
-CRAG_CORRECT_THRESHOLD   = 0.7             # score >= this → auto CORRECT, skip LLM
-CRAG_AMBIGUOUS_THRESHOLD = 0.4             # score < this  → auto INCORRECT, skip LLM

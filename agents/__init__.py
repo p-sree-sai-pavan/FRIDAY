@@ -1,3 +1,0 @@
-"""
-FRIDAY Agents Package
-"""

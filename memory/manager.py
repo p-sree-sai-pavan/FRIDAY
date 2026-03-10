@@ -111,8 +111,9 @@ def _cosine(a, b) -> float:
 # Fix A+B: all CPU/IO ops wrapped in asyncio.to_thread
 
 async def _encode(text: str) -> np.ndarray:
-    """Encode text to dense vector — offloaded to thread."""
-    return await asyncio.to_thread(embedder.encode, text)
+    return await asyncio.to_thread(
+        lambda: embedder.encode(text, show_progress_bar=False)
+    )
 
 async def _sparse(text: str) -> SparseVector:
     """Encode text to sparse BM25 vector — offloaded to thread."""
