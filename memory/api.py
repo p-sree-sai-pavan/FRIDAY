@@ -6,7 +6,7 @@ The public API for the FRIDAY Memory Manager.
 
 import asyncio
 
-from .core.resources import _res, groq_client
+from .core.resources import _res
 from .core.sqlite import write_semantic, search_semantic, get_user_profile, save_user_profile, save_feedback
 from .core.qdrant import write_episodic, search_episodic
 from .core.working import search_working
@@ -17,7 +17,7 @@ import config
 async def read(query: str) -> list:
     """Full pipeline: HyDE -> Hybrid search -> CRAG grade -> web fallback."""
     count = 0
-    if _res._qdrant is not None or _res.qdrant_available:
+    if _res.qdrant_available:
         try:
             def _count():
                 return _res.qdrant.count(collection_name=config.MEMORY_COLLECTION).count
@@ -63,5 +63,4 @@ __all__ = [
     "save_user_profile",
     "save_feedback",
     "compress_results",
-    "groq_client"
 ]

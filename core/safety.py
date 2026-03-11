@@ -28,6 +28,10 @@ async def check(tool, arguments: dict) -> Decision:
         return Decision.AUTO
 
     if tool.risk == RiskLevel.WRITE:
+        # FIX: Previously logged to file only — no feedback to Pavan.
+        # Print a short notice so Pavan knows what's being executed automatically.
+        args_display = ", ".join(f"{k}={v}" for k, v in arguments.items())
+        print(f"\033[93m[FRIDAY] Auto-executing: {tool.name}({args_display})\033[0m")
         log.info(f"[Safety] Auto-executing WRITE tool: {tool.name}")
         return Decision.AUTO
 

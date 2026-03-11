@@ -34,7 +34,7 @@ async def search_working(query: str) -> dict:
         if not history:
             return {"source": "working", "content": [], "relevance": 0}
 
-        recent = history[-config.WORKING_MEMORY_LIMIT:]
+        recent = history[-config.MAX_HISTORY:]
         q_vec = await encode_dense(query)
 
         scored = []

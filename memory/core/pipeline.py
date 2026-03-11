@@ -6,7 +6,7 @@ The LLM pipeline for memory: HyDE (query expansion) and CRAG (grading).
 
 import asyncio
 import logging
-from .resources import groq_client
+from core.model_client import get_client
 import config
 
 log = logging.getLogger("memory.pipeline")
@@ -25,13 +25,17 @@ def compress_results(results: list) -> str:
         elif r["source"] == "semantic":
             sub = [f"FACT -> {msg['category']} | {msg['key']}: {msg['value']}" for msg in r["content"]]
             text += "\n".join(sub) + "\n"
+        elif r["source"] == "web_fallback":
+            # FIX: was silently dropped before — web search results now included
+            sub = [msg["text"] for msg in r["content"]]
+            text += "\n".join(sub) + "\n"
     return text.strip()
 
 
 async def hyde_transform(query: str) -> str:
     """Expand query with hypothetical document embeddings (keywords)."""
     try:
-        resp = await groq_client.chat.completions.create(
+        resp = await get_client().chat.completions.create(
             model=config.FAST_MODEL, temperature=0.3, max_tokens=60,
             messages=[{"role": "user", "content":
                 f"Expand into search keywords only. No answer. Query: {query}\nSearch terms:"}]
@@ -51,7 +55,7 @@ async def _crag_grade_single(query: str, result: dict) -> str:
         return "INCORRECT"
     try:
         compressed = compress_results([result])
-        resp = await groq_client.chat.completions.create(
+        resp = await get_client().chat.completions.create(
             model=config.FAST_MODEL, temperature=0, max_tokens=10,
             messages=[{"role": "user", "content":
                 f"Grade: CORRECT, AMBIGUOUS, or INCORRECT.\nQuery: {query}\nContext: {compressed}\nGrade:"}]

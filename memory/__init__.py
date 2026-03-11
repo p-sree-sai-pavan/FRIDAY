@@ -12,7 +12,6 @@ from .api import (
     save_user_profile,
     save_feedback,
     compress_results,
-    groq_client
 )
 
 __all__ = [
@@ -23,5 +22,4 @@ __all__ = [
     "save_user_profile",
     "save_feedback",
     "compress_results",
-    "groq_client"
 ]

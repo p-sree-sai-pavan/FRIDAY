@@ -4,17 +4,20 @@ core/orchestrator.py
 FRIDAY Orchestrator — Unified Tool-Call Pipeline
 
 All prompts follow one path:
-  1. Classify prompt → pick model (never FAST_MODEL when tools exist)
-  2. First call with tools available (tool_choice="auto")
+  1. Classify prompt → pick model
+  2. First call with tools available
      - Plain text response → faithfulness check → save to memory, return
      - Tool call(s) detected → switch to TOOLS_MODEL for execution loop
-  3. Tool execution loop (TOOLS_MODEL, max 6 iterations):
+  3. Tool execution loop (max 12 iterations):
      - safety check each tool call
      - execute approved tools (parallel if multiple)
      - feed results back to LLM
      - repeat until plain text final response
   4. Save final response + extract facts to memory
-  5. Gemini fallback if Groq fails entirely
+  5. Gemini fallback (online mode only) if Groq fails entirely
+
+The orchestrator is mode-agnostic — it always calls get_client() from
+model_client.py which returns the correct provider for the current mode.
 """
 
 import asyncio
@@ -26,48 +29,47 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import config
 
-# Import tools package to trigger tool registration (tools/__init__.py auto-discovers tools)
-import tools  # noqa: F401 — side-effect import
+import tools  # noqa: F401 — side-effect import triggers tool registration
 
-from memory import groq_client, read as memory_read, write as memory_write, compress_results, write_semantic
+from memory import read as memory_read, write as memory_write, compress_results, write_semantic
 from core.brain import _load_system_prompt, _load_history, _save_history, _parse_response, _faithfulness_check
+from core.model_client import get_client, get_fallback_client
 
 log = logging.getLogger("orchestrator")
 
 MAX_TOOL_ITERATIONS = 12
 
-# Queries that must always use PRIMARY_MODEL — small models ignore injected context
 MEMORY_TRIGGERS = (
     "what do you know", "do you remember", "what did i",
     "who am i", "tell me about me", "what have i", "my details"
 )
 
-# Track background tasks to prevent garbage collection
 _background_tasks: set = set()
 
 
 # ========================
 # MODEL SELECTOR
-# Rules:
-#   1. Tools registered → always PRIMARY_MODEL (FAST_MODEL cannot call tools)
-#   2. Memory/personal query → always PRIMARY_MODEL (small models ignore context)
-#   3. Otherwise → classify with FAST_MODEL, use result
 # ========================
 
 async def _select_model(prompt: str, has_tools: bool) -> str:
-    # Rule 1 — tools need a capable model
+    """
+    Pick primary vs fast model based on prompt complexity.
+    Rules:
+      1. Tools registered → always PRIMARY (FAST can't call tools reliably)
+      2. Memory/personal query → always PRIMARY (small models ignore injected context)
+      3. Otherwise → ask FAST to classify, use result
+    """
     if has_tools:
-        log.info("[Orchestrator] Tools registered — using PRIMARY_MODEL")
+        log.info("[Orchestrator] Tools present — using PRIMARY_MODEL")
         return config.PRIMARY_MODEL
 
-    # Rule 2 — memory queries need a model that follows injected context
     if any(t in prompt.lower() for t in MEMORY_TRIGGERS):
         log.info("[Orchestrator] Memory query — using PRIMARY_MODEL")
         return config.PRIMARY_MODEL
 
-    # Rule 3 — safe to classify for tool-free simple queries
     try:
-        resp = await groq_client.chat.completions.create(
+        client = get_client()
+        resp = await client.chat.completions.create(
             model=config.FAST_MODEL,
             temperature=0,
             max_tokens=5,
@@ -92,17 +94,20 @@ async def _select_model(prompt: str, has_tools: bool) -> str:
 
 # ========================
 # BACKGROUND FACT EXTRACTION
-# Runs silently after every response.
-# Extracts personal facts about Pavan and writes them to facts.db.
 # ========================
 
 async def _extract_facts(prompt: str, response: str):
+    """Extract personal facts about Pavan and persist them to facts.db."""
     try:
-        resp = await groq_client.chat.completions.create(
+        client = get_client()
+        # response_format=json_object is Groq-native; Ollama supports it on some
+        # models but not all. We include it only in online mode and always wrap
+        # json.loads in a try/except so a plain-text reply doesn't crash anything.
+        extra = {"response_format": {"type": "json_object"}} if config.MODEL_MODE == "online" else {}
+        resp = await client.chat.completions.create(
             model=config.FAST_MODEL,
             temperature=0,
             max_tokens=200,
-            response_format={"type": "json_object"},
             messages=[{
                 "role": "user",
                 "content": (
@@ -112,9 +117,13 @@ async def _extract_facts(prompt: str, response: str):
                     "or {\"facts\": []} if nothing factual was stated.\n\n"
                     f"User: {prompt}\nFRIDAY: {response}"
                 )
-            }]
+            }],
+            **extra
         )
-        data  = json.loads(resp.choices[0].message.content)
+        raw  = resp.choices[0].message.content or ""
+        # Strip markdown fences if model wrapped response anyway
+        raw  = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+        data  = json.loads(raw)
         facts = data.get("facts", [])
         for fact in facts:
             if all(k in fact for k in ("category", "key", "value")):
@@ -124,7 +133,6 @@ async def _extract_facts(prompt: str, response: str):
 
 
 def _launch_background(coro):
-    """Launch a background coroutine safely — stores task ref to prevent GC."""
     task = asyncio.create_task(coro)
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
@@ -136,8 +144,9 @@ def _launch_background(coro):
 
 async def _ask_confirmation(tool_name: str, arguments: dict, session) -> bool:
     args_display = ", ".join(f"{k}={v}" for k, v in arguments.items())
-    prompt_text  = f"\n[FRIDAY] About to run: {tool_name}({args_display})\nAllow? (y/n): "
-    answer = await session.prompt_async(prompt_text)
+    answer = await session.prompt_async(
+        f"\n[FRIDAY] About to run: {tool_name}({args_display})\nAllow? (y/n): "
+    )
     return answer.strip().lower() in ("y", "yes")
 
 
@@ -176,17 +185,25 @@ async def _execute_tool(tool_name: str, arguments: dict, session) -> str:
 # TOOL-CALL LOOP
 # ========================
 
-async def _tool_loop(messages: list, tools: list, session) -> str:
+async def _tool_loop(messages: list, tool_schemas: list, session) -> str:
+    """
+    Continue calling the LLM + executing tools until it returns a plain text response.
+    Caps at MAX_TOOL_ITERATIONS to prevent infinite loops.
+    """
+    client = get_client()
+
     for iteration in range(MAX_TOOL_ITERATIONS):
         try:
-            resp = await groq_client.chat.completions.create(
+            resp = await client.chat.completions.create(
                 model=config.TOOLS_MODEL,
                 temperature=config.TEMPERATURE,
                 max_tokens=config.MAX_TOKENS,
                 messages=messages,
-                tools=tools,
+                tools=tool_schemas,
                 tool_choice="auto",
-                parallel_tool_calls=True
+                # parallel_tool_calls is Groq-specific — Ollama's OpenAI-compatible
+                # endpoint does not support it and returns a 400. Only send it online.
+                **({ "parallel_tool_calls": True } if config.MODEL_MODE == "online" else {})
             )
         except Exception as e:
             log.error(f"[Orchestrator] Tool loop API error (iteration {iteration}): {e}")
@@ -229,7 +246,7 @@ async def _tool_loop(messages: list, tools: list, session) -> str:
             })
 
     log.warning("[Orchestrator] Max tool iterations reached.")
-    return "I ran into a problem completing that — it required too many steps. Please try breaking it into smaller requests."
+    return "I ran into a problem completing that — it required too many steps. Try breaking it into smaller requests."
 
 
 # ========================
@@ -239,9 +256,8 @@ async def _tool_loop(messages: list, tools: list, session) -> str:
 async def orchestrate(prompt: str, session) -> dict:
     from tools.registry import registry
 
-    system_prompt = _load_system_prompt()
-    history       = _load_history()
-
+    system_prompt  = _load_system_prompt()
+    history        = _load_history()
     memory_results = await memory_read(prompt)
     context        = compress_results(memory_results)
 
@@ -256,31 +272,30 @@ async def orchestrate(prompt: str, session) -> dict:
     messages += history
     messages.append({"role": "user", "content": prompt})
 
-    tools      = registry.to_groq_tools()
-    final_text = ""
+    tool_schemas = registry.to_groq_tools()
+    final_text   = ""
+    client       = get_client()
 
-    # Select model — never FAST_MODEL when tools are registered
-    model = await _select_model(prompt, has_tools=bool(tools))
+    model = await _select_model(prompt, has_tools=bool(tool_schemas))
 
     try:
-        resp = await groq_client.chat.completions.create(
+        resp = await client.chat.completions.create(
             model=model,
             temperature=config.TEMPERATURE,
             max_tokens=config.MAX_TOKENS,
             messages=messages,
-            tools=tools if tools else None,
-            tool_choice="auto" if tools else None
+            tools=tool_schemas if tool_schemas else None,
+            tool_choice="auto" if tool_schemas else None
         )
 
         message = resp.choices[0].message
 
         if not message.tool_calls:
             log.info("[Orchestrator] Direct response — no tools.")
-            result     = _parse_response(message.content or "")
-            final_text = result.get("response", "")
+            final_text = _parse_response(message.content or "").get("response", "")
 
         else:
-            log.info(f"[Orchestrator] {len(message.tool_calls)} tool call(s) — switching to TOOLS_MODEL.")
+            log.info(f"[Orchestrator] {len(message.tool_calls)} tool call(s) — entering tool loop.")
 
             messages.append({
                 "role":       "assistant",
@@ -312,20 +327,26 @@ async def orchestrate(prompt: str, session) -> dict:
                     "content":      result
                 })
 
-            final_text = await _tool_loop(messages, tools, session)
+            final_text = await _tool_loop(messages, tool_schemas, session)
 
     except Exception as e:
-        log.error(f"[Orchestrator] Groq error: {e}")
-        try:
-            from google import genai
-            client = genai.Client(api_key=config.GEMINI_API_KEY)
-            resp   = client.models.generate_content(model=config.FALLBACK_MODEL, contents=prompt)
-            result = _parse_response(resp.text)
-            final_text = result.get("response", "")
-            log.info("[Orchestrator] Gemini fallback succeeded.")
-        except Exception as e2:
-            log.error(f"[Orchestrator] Gemini fallback error: {e2}")
-            final_text = "Both primary and fallback models failed."
+        log.error(f"[Orchestrator] Primary client error: {e}")
+
+        # Gemini fallback — online mode only
+        fallback = get_fallback_client()
+        if fallback:
+            try:
+                resp       = fallback.models.generate_content(model=config.FALLBACK_MODEL, contents=prompt)
+                final_text = _parse_response(resp.text).get("response", "")
+                log.info("[Orchestrator] Gemini fallback succeeded.")
+            except Exception as e2:
+                log.error(f"[Orchestrator] Gemini fallback error: {e2}")
+                final_text = "Both primary and fallback models failed."
+        else:
+            if config.MODEL_MODE == "offline":
+                final_text = "Ollama is not responding. Make sure it is running: ollama serve"
+            else:
+                final_text = "Primary model failed and no fallback is configured."
 
     # Save conversation history
     history.append({"role": "user",      "content": prompt})
@@ -343,7 +364,6 @@ async def orchestrate(prompt: str, session) -> dict:
         else:
             await memory_write(prompt, final_text)
 
-    # Background — extract personal facts (safe: task ref is stored)
     if final_text:
         _launch_background(_extract_facts(prompt, final_text))
 

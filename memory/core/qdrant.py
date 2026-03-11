@@ -17,7 +17,7 @@ log = logging.getLogger("memory.qdrant")
 
 
 async def search_episodic(query: str) -> dict:
-    if _res._qdrant is None and not _res.qdrant_available:
+    if not _res.qdrant_available:
         return {"source": "episodic", "content": [], "relevance": 0}
     try:
         from qdrant_client.models import Prefetch, FusionQuery, Fusion
@@ -51,7 +51,7 @@ async def search_episodic(query: str) -> dict:
 
 
 async def write_episodic(prompt: str, response: str):
-    if _res._qdrant is None and not _res.qdrant_available:
+    if not _res.qdrant_available:
         log.debug("[Memory] Qdrant unavailable — skipping episodic write")
         return
     try:

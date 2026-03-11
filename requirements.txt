@@ -2,6 +2,21 @@
 groq>=0.9.0
 google-genai>=0.8.0
 
+# Offline mode (Ollama local inference)
+openai>=1.0.0        # OpenAI-compatible client — works with Ollama's /v1 endpoint
+httpx>=0.27.0        # used to ping Ollama at startup to check availability
+
+# Voice Input (ears.py)
+sounddevice>=0.4.6   # cross-platform microphone capture and audio playback
+webrtcvad>=2.0.10    # Google's VAD — detects speech vs silence in 30ms frames
+faster-whisper>=1.0.0  # offline Whisper STT on GPU (offline mode)
+# Online STT: uses groq.audio.transcriptions (whisper-large-v3) — already in groq package
+
+# Voice Output (mouth.py)
+edge-tts>=6.1.9      # Microsoft Neural TTS (online mode) — free, no API key
+pydub>=0.25.1        # MP3 decode for edge-tts output  (also needs ffmpeg on PATH)
+pyttsx3>=2.90        # Windows SAPI TTS (offline mode) — zero dependencies
+
 # Memory
 qdrant-client>=1.9.0
 sentence-transformers>=3.0.0

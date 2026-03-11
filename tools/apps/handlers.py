@@ -2,13 +2,19 @@
 tools/apps/handlers.py
 ======================
 The actual tool handler functions executed by the AI agent.
+
+All handlers are async. resolve_app is now a native async function,
+so open_app_handler calls it with a plain `await` — no asyncio.to_thread
+wrapper needed.
 """
 
 import asyncio
 import ctypes
 import difflib
 import logging
+import os
 import subprocess
+import webbrowser
 
 import psutil
 
@@ -21,26 +27,24 @@ log = logging.getLogger("apps.handlers")
 
 
 async def open_app_handler(name: str) -> str:
-    """Open one or more applications by name with smart resolution."""
+    """Open one or more applications by name with smart async resolution."""
     names = [n.strip() for n in name.split(",") if n.strip()]
     if not names:
         return "No app name provided."
 
     results = []
-    import os
-    import webbrowser
 
     for app_name in names:
-        command, source = resolve_app(app_name)
-        log.info(f"[Apps] Opening '{app_name}' -> command='{command}' (source: {source})")
+        # resolve_app is now fully async — direct await, no thread wrapper needed
+        command, source = await resolve_app(app_name)
+        log.info(f"[Apps] Opening '{app_name}' → '{command}' (source: {source})")
 
         try:
-            # Expand environment variables (e.g., %ProgramFiles%)
             expanded_cmd = os.path.expandvars(command)
 
-            # Case 1: Explicit Web URIs or native Windows URIs
+            # Case 1: Explicit web or Windows URI (start http..., start ms-settings:, etc.)
             if expanded_cmd.lower().startswith("start "):
-                target = expanded_cmd[6:].strip() # remove 'start '
+                target = expanded_cmd[6:].strip()
                 if target.startswith("http"):
                     webbrowser.open(target)
                 else:
@@ -48,23 +52,20 @@ async def open_app_handler(name: str) -> str:
                 results.append(f"Opened {app_name}")
                 continue
 
-            # Case 2: Native App Path Resolution
-            # os.startfile uses native Windows ShellExecute, which natively
-            # understands 'chrome', 'spotify', etc., from the App Paths registry.
-            # It only accepts strings without arguments, so we try this first.
+            # Case 2: Simple app name / path — ShellExecute via os.startfile.
+            # Windows resolves bare names like 'chrome', 'spotify' through App Paths registry.
+            # Only works without arguments.
             try:
                 clean_target = expanded_cmd.strip('"')
                 os.startfile(clean_target)
                 results.append(f"Opened {app_name}")
                 continue
             except (OSError, FileNotFoundError):
-                pass # Proceed to Case 3 if it has arguments or requires a shell
+                pass  # Fall through to shell launch if it has arguments
 
-            # Case 3: Complex commands with arguments
-            # Use cmd.exe's start command, but safely:
-            # `start ""` prevents the bug where first quoted string becomes the window title.
-            safe_shell_cmd = f'start "" {expanded_cmd}'
-            subprocess.Popen(safe_shell_cmd, shell=True)
+            # Case 3: Complex commands with arguments — use cmd.exe's start.
+            # `start ""` prevents the first quoted string from being treated as the window title.
+            subprocess.Popen(f'start "" {expanded_cmd}', shell=True)
             results.append(f"Opened {app_name}")
 
         except Exception as e:
@@ -75,16 +76,22 @@ async def open_app_handler(name: str) -> str:
 
 
 async def close_app_handler(name: str) -> str:
-    """Close/kill an app by name."""
+    """Close/kill an app by name, with system process protection."""
     key = name.lower().strip()
-    closed = []
+    key_no_exe = key.replace(".exe", "")
+
+    # Guard: never kill known system processes
+    if key in SYSTEM_PROCESSES or (key_no_exe + ".exe") in SYSTEM_PROCESSES:
+        return f"Refusing to close protected system process: '{name}'."
+
+    closed    = []
     not_found = True
 
     for proc in psutil.process_iter(["pid", "name"]):
         try:
-            pname = proc.info["name"] or ""
+            pname       = proc.info["name"] or ""
             pname_lower = pname.lower()
-            pname_bare = pname_lower.replace(".exe", "")
+            pname_bare  = pname_lower.replace(".exe", "")
 
             if key in (pname_lower, pname_bare) or (
                 difflib.SequenceMatcher(None, key, pname_bare).ratio() > 0.7
@@ -96,19 +103,19 @@ async def close_app_handler(name: str) -> str:
                 except psutil.TimeoutExpired:
                     proc.kill()
                 closed.append(f"{pname} (PID {proc.info['pid']})")
+
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue
 
     if not_found:
         return f"No running process found matching '{name}'."
-
     if closed:
         return f"Closed: {', '.join(closed)}"
     return f"Found '{name}' but could not close it (access denied)."
 
 
 async def list_running_apps_handler() -> str:
-    """List all running GUI applications (not system processes)."""
+    """List all running user applications, excluding system processes."""
     apps = []
 
     for proc in psutil.process_iter(["pid", "name", "memory_info", "status"]):
@@ -118,15 +125,17 @@ async def list_running_apps_handler() -> str:
                 continue
             if pname.lower() in SYSTEM_PROCESSES:
                 continue
-            if proc.info["status"] != psutil.STATUS_RUNNING:
+            # On Windows, apps waiting for input report 'sleeping' not 'running'.
+            # Only skip genuinely dead/zombie processes.
+            if proc.info["status"] in (psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD):
                 continue
 
-            mem = proc.info.get("memory_info")
+            mem    = proc.info.get("memory_info")
             mem_mb = round(mem.rss / (1024 * 1024), 1) if mem else 0
 
             apps.append({
-                "name": pname.replace(".exe", ""),
-                "pid": proc.info["pid"],
+                "name":      pname.replace(".exe", ""),
+                "pid":       proc.info["pid"],
                 "memory_mb": mem_mb
             })
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
@@ -135,34 +144,35 @@ async def list_running_apps_handler() -> str:
     if not apps:
         return "No visible applications are currently running."
 
+    # Deduplicate by name, keeping the highest-memory instance
     seen: dict[str, dict] = {}
     for app in apps:
-        key = app["name"].lower()
-        if key not in seen or app["memory_mb"] > seen[key]["memory_mb"]:
-            seen[key] = app
+        k = app["name"].lower()
+        if k not in seen or app["memory_mb"] > seen[k]["memory_mb"]:
+            seen[k] = app
 
     sorted_apps = sorted(seen.values(), key=lambda x: x["memory_mb"], reverse=True)
 
     lines = [f"Running apps ({len(sorted_apps)}):"]
     for app in sorted_apps[:25]:
-        lines.append(f"  - {app['name']} -- {app['memory_mb']} MB (PID {app['pid']})")
+        lines.append(f"  - {app['name']} — {app['memory_mb']} MB (PID {app['pid']})")
 
     return "\n".join(lines)
 
 
 async def list_installed_apps_handler() -> str:
     """List all installed applications discovered from Start Menu shortcuts."""
-    start_menu = scan_start_menu()
+    start_menu = await asyncio.to_thread(scan_start_menu)
 
     if not start_menu:
         return "Could not find any installed apps from Start Menu."
 
     skip_words = {"uninstall", "readme", "help", "documentation", "license", "release notes"}
-    apps = []
-    for name in sorted(start_menu.keys()):
-        if any(s in name.lower() for s in skip_words):
-            continue
-        apps.append(name.title())
+    apps = [
+        name.title()
+        for name in sorted(start_menu.keys())
+        if not any(s in name.lower() for s in skip_words)
+    ]
 
     if not apps:
         return "No installed apps found."
@@ -177,16 +187,14 @@ async def list_installed_apps_handler() -> str:
 async def switch_to_app_handler(name: str) -> str:
     """Bring an app window to the foreground."""
     try:
-        user32 = ctypes.windll.user32
+        user32     = ctypes.windll.user32
         hwnd, title = _find_window(name)
 
         if hwnd is None:
             return f"No window found for '{name}'. The app might not be running."
 
-        SW_RESTORE = 9
-        user32.ShowWindow(hwnd, SW_RESTORE)
+        user32.ShowWindow(hwnd, 9)       # SW_RESTORE
         user32.SetForegroundWindow(hwnd)
-
         return f"Switched to: {title}"
 
     except Exception as e:
@@ -197,15 +205,13 @@ async def switch_to_app_handler(name: str) -> str:
 async def minimize_app_handler(name: str) -> str:
     """Minimize an app window."""
     try:
-        user32 = ctypes.windll.user32
+        user32      = ctypes.windll.user32
         hwnd, title = _find_window(name)
 
         if hwnd is None:
             return f"No window found for '{name}'. The app might not be running."
 
-        SW_MINIMIZE = 6
-        user32.ShowWindow(hwnd, SW_MINIMIZE)
-
+        user32.ShowWindow(hwnd, 6)  # SW_MINIMIZE
         return f"Minimized: {title}"
 
     except Exception as e:
@@ -216,16 +222,14 @@ async def minimize_app_handler(name: str) -> str:
 async def maximize_app_handler(name: str) -> str:
     """Maximize an app window."""
     try:
-        user32 = ctypes.windll.user32
+        user32      = ctypes.windll.user32
         hwnd, title = _find_window(name)
 
         if hwnd is None:
             return f"No window found for '{name}'. The app might not be running."
 
-        SW_MAXIMIZE = 3
-        user32.ShowWindow(hwnd, SW_MAXIMIZE)
+        user32.ShowWindow(hwnd, 3)       # SW_MAXIMIZE
         user32.SetForegroundWindow(hwnd)
-
         return f"Maximized: {title}"
 
     except Exception as e:
@@ -234,45 +238,48 @@ async def maximize_app_handler(name: str) -> str:
 
 
 async def snap_window_handler(name: str, position: str = "left") -> str:
-    """Snap a window to left or right half of the screen."""
+    """Snap a window to a position on screen."""
     try:
-        user32 = ctypes.windll.user32
+        user32      = ctypes.windll.user32
         hwnd, title = _find_window(name)
 
         if hwnd is None:
             return f"No window found for '{name}'. The app might not be running."
 
         screen_w, screen_h = _get_screen_size()
-        SW_RESTORE = 9
-        user32.ShowWindow(hwnd, SW_RESTORE)
-
-        pos = position.lower().strip()
+        user32.ShowWindow(hwnd, 9)   # SW_RESTORE first
         SWP_NOZORDER = 0x0004
+        pos = position.lower().strip()
 
-        if pos in ("left", "l"):
-            user32.SetWindowPos(hwnd, 0, 0, 0, screen_w // 2, screen_h, SWP_NOZORDER)
-        elif pos in ("right", "r"):
-            user32.SetWindowPos(hwnd, 0, screen_w // 2, 0, screen_w // 2, screen_h, SWP_NOZORDER)
-        elif pos in ("top", "top-half"):
-            user32.SetWindowPos(hwnd, 0, 0, 0, screen_w, screen_h // 2, SWP_NOZORDER)
-        elif pos in ("bottom", "bottom-half"):
-            user32.SetWindowPos(hwnd, 0, 0, screen_h // 2, screen_w, screen_h // 2, SWP_NOZORDER)
-        elif pos in ("top-left", "tl"):
-            user32.SetWindowPos(hwnd, 0, 0, 0, screen_w // 2, screen_h // 2, SWP_NOZORDER)
-        elif pos in ("top-right", "tr"):
-            user32.SetWindowPos(hwnd, 0, screen_w // 2, 0, screen_w // 2, screen_h // 2, SWP_NOZORDER)
-        elif pos in ("bottom-left", "bl"):
-            user32.SetWindowPos(hwnd, 0, 0, screen_h // 2, screen_w // 2, screen_h // 2, SWP_NOZORDER)
-        elif pos in ("bottom-right", "br"):
-            user32.SetWindowPos(hwnd, 0, screen_w // 2, screen_h // 2, screen_w // 2, screen_h // 2, SWP_NOZORDER)
-        elif pos in ("center", "c"):
-            w, h = screen_w // 2, screen_h // 2
-            user32.SetWindowPos(hwnd, 0, (screen_w - w) // 2, (screen_h - h) // 2, w, h, SWP_NOZORDER)
-        elif pos in ("fullscreen", "full", "fill"):
-            SW_MAXIMIZE = 3
-            user32.ShowWindow(hwnd, SW_MAXIMIZE)
+        positions = {
+            ("left",   "l"):                     (0,              0,             screen_w // 2, screen_h),
+            ("right",  "r"):                     (screen_w // 2,  0,             screen_w // 2, screen_h),
+            ("top",    "top-half"):               (0,              0,             screen_w,      screen_h // 2),
+            ("bottom", "bottom-half"):            (0,              screen_h // 2, screen_w,      screen_h // 2),
+            ("top-left",     "tl"):              (0,              0,             screen_w // 2, screen_h // 2),
+            ("top-right",    "tr"):              (screen_w // 2,  0,             screen_w // 2, screen_h // 2),
+            ("bottom-left",  "bl"):              (0,              screen_h // 2, screen_w // 2, screen_h // 2),
+            ("bottom-right", "br"):              (screen_w // 2,  screen_h // 2, screen_w // 2, screen_h // 2),
+            ("center", "c"):                     ((screen_w - screen_w // 2) // 2,
+                                                  (screen_h - screen_h // 2) // 2,
+                                                  screen_w // 2, screen_h // 2),
+        }
+
+        if pos in ("fullscreen", "full", "fill"):
+            user32.ShowWindow(hwnd, 3)  # SW_MAXIMIZE
         else:
-            return f"Unknown position '{position}'. Use: left, right, top, bottom, top-left, top-right, bottom-left, bottom-right, center, fullscreen."
+            rect = None
+            for keys, coords in positions.items():
+                if pos in keys:
+                    rect = coords
+                    break
+
+            if rect is None:
+                valid = "left, right, top, bottom, top-left, top-right, bottom-left, bottom-right, center, fullscreen"
+                return f"Unknown position '{position}'. Valid options: {valid}"
+
+            x, y, w, h = rect
+            user32.SetWindowPos(hwnd, 0, x, y, w, h, SWP_NOZORDER)
 
         user32.SetForegroundWindow(hwnd)
         return f"Snapped '{title}' to {position}."
@@ -288,15 +295,16 @@ async def is_app_running_handler(name: str) -> str:
 
     for proc in psutil.process_iter(["pid", "name", "memory_info"]):
         try:
-            pname = proc.info["name"] or ""
+            pname      = proc.info["name"] or ""
             pname_bare = pname.lower().replace(".exe", "")
 
             if key in (pname.lower(), pname_bare) or (
                 difflib.SequenceMatcher(None, key, pname_bare).ratio() > 0.7
             ):
-                mem = proc.info.get("memory_info")
+                mem    = proc.info.get("memory_info")
                 mem_mb = round(mem.rss / (1024 * 1024), 1) if mem else 0
                 return f"Yes, {pname} is running (PID {proc.info['pid']}, {mem_mb} MB)."
+
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
 
@@ -304,13 +312,13 @@ async def is_app_running_handler(name: str) -> str:
 
 
 async def restart_app_handler(name: str) -> str:
-    """Close and reopen an app."""
+    """Close an app and reopen it. Useful when an app is frozen."""
     close_result = await close_app_handler(name)
-    log.info(f"[Apps] Restart - close phase: {close_result}")
+    log.info(f"[Apps] Restart — close phase: {close_result}")
 
-    await asyncio.sleep(1.5)
+    await asyncio.sleep(1.5)   # give the OS time to release file handles
 
     open_result = await open_app_handler(name)
-    log.info(f"[Apps] Restart - open phase: {open_result}")
+    log.info(f"[Apps] Restart — open phase: {open_result}")
 
-    return f"Restarted {name}. {close_result} {open_result}"
+    return f"Restarted {name}. {close_result} → {open_result}"

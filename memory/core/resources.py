@@ -1,10 +1,26 @@
 """
 memory/core/resources.py
 ========================
-Manages the lazy initialization of all heavy resources: ML models, Qdrant, and SQLite.
-Loading is deferred until first access to ensure instant startup.
+Manages all heavy resources: ML models, Qdrant, and SQLite.
+
+ARCHITECTURE:
+  Previously used lazy-property loading with a shared threading.Lock.
+  This caused a deadlock on first run: _init_qdrant() held the lock and
+  then called self.vector_size → _init_models() → tried to re-acquire
+  the same non-reentrant lock → hung forever.
+
+  Now: a single explicit `await _res.initialize()` is called once from
+  main.py after pre-flight checks. Steps run sequentially in threads
+  with a deterministic order — no shared lock is needed:
+    1. Load ML models   (must come first — Qdrant needs vector_size)
+    2. Setup Qdrant     (depends on vector_size from step 1)
+    3. Setup SQLite     (independent, fast)
+
+  After initialize() completes, all attributes are plain values.
+  No properties, no locks, safe to read from any async or sync context.
 """
 
+import asyncio
 import atexit
 import logging
 import os
@@ -13,14 +29,15 @@ import sys
 import threading
 
 import psutil
-from groq import AsyncGroq
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 import config
 
 log = logging.getLogger("memory.resources")
 
-# Constants
+# ========================
+# PATHS
+# ========================
 QDRANT_PATH  = os.path.join(config.MEMORY_PATH, "qdrant")
 HISTORY_FILE = os.path.join(config.MEMORY_PATH, "memory.json")
 SEMANTIC_DB  = os.path.join(config.MEMORY_PATH, "facts.db")
@@ -28,199 +45,224 @@ SEMANTIC_DB  = os.path.join(config.MEMORY_PATH, "facts.db")
 os.makedirs(config.MEMORY_PATH, exist_ok=True)
 os.makedirs(QDRANT_PATH, exist_ok=True)
 
-# Shared Groq Client (no network call until first use)
-groq_client = AsyncGroq(api_key=config.GROQ_API_KEY or "")
+# Shared Groq async client — no network call until first use
 
 
-class _LazyResources:
-    """Thread-safe lazy loader for ML models, Qdrant, and SQLite."""
+class Resources:
+    """
+    Holds all initialized resources as plain attributes.
+
+    Usage:
+        from memory.core.resources import _res
+        await _res.initialize()     # call once in main.py
+        _res.embedder.encode(...)   # use anywhere after that
+        _res.qdrant.search(...)
+        _res.db.execute(...)
+    """
 
     def __init__(self):
-        self._lock = threading.Lock()
-        self._embedder = None
-        self._sparse_embedder = None
-        self._vector_size = None
-        self._qdrant = None
-        self._db = None
-        self._db_lock = threading.Lock()   # serializes SQLite writes
+        # ML models
+        self.embedder:         object = None
+        self.sparse_embedder:  object = None
+        self.vector_size:      int    = None
+
+        # Qdrant
+        self.qdrant:           object = None
+        self.qdrant_available: bool   = False
+
+        # SQLite
+        self.db:      sqlite3.Connection = None
+        self.db_lock: threading.Lock     = threading.Lock()
+
         self._initialized = False
 
-    # --- ML Models ---
+    # ========================
+    # PUBLIC ENTRY POINT
+    # ========================
 
-    @property
-    def embedder(self):
-        if self._embedder is None:
-            self._init_models()
-        return self._embedder
+    async def initialize(self) -> None:
+        """
+        Initialize all resources in the correct dependency order.
+        Safe to call multiple times — no-ops after the first call.
+        Each step runs inside asyncio.to_thread so the event loop
+        is never blocked. Steps are sequential by design — Qdrant
+        depends on vector_size which comes from the model step.
+        """
+        if self._initialized:
+            return
 
-    @property
-    def sparse_embedder(self):
-        if self._sparse_embedder is None:
-            self._init_models()
-        return self._sparse_embedder
+        log.info("[Resources] Starting initialization...")
 
-    @property
-    def vector_size(self):
-        if self._vector_size is None:
-            self._init_models()
-        return self._vector_size
+        await asyncio.to_thread(self._load_models)    # Step 1: models (~2-3s)
+        await asyncio.to_thread(self._setup_qdrant)   # Step 2: vector store
+        await asyncio.to_thread(self._setup_sqlite)   # Step 3: fact DB
 
-    def _init_models(self):
-        with self._lock:
-            if self._embedder is not None:
-                return
-            log.info("[Memory] Loading embedding models (first-time only)...")
-            from sentence_transformers import SentenceTransformer
-            from fastembed import SparseTextEmbedding
-            self._embedder = SentenceTransformer(config.EMBEDDING_MODEL)
-            self._sparse_embedder = SparseTextEmbedding(model_name=config.SPARSE_MODEL)
-            self._vector_size = self._embedder.get_sentence_embedding_dimension()
-            log.info(f"[Memory] Models loaded. Dense dim={self._vector_size}")
+        self._initialized = True
+        log.info("[Resources] All resources ready.")
 
-    # --- Qdrant ---
+    # ========================
+    # STEP 1 — ML Models
+    # ========================
 
-    @property
-    def qdrant(self):
-        if self._qdrant is None:
-            self._init_qdrant()
-        return self._qdrant
+    def _load_models(self) -> None:
+        """Load dense and sparse embedding models. Runs in a thread."""
+        log.info("[Resources] Loading embedding models...")
+        from sentence_transformers import SentenceTransformer
+        from fastembed import SparseTextEmbedding
 
-    @property
-    def qdrant_available(self) -> bool:
-        """Check if Qdrant is available without triggering init."""
-        if self._qdrant is not None:
-            return True
-        try:
-            self._init_qdrant()
-            return self._qdrant is not None
-        except Exception:
-            return False
+        self.embedder        = SentenceTransformer(config.EMBEDDING_MODEL)
+        self.sparse_embedder = SparseTextEmbedding(model_name=config.SPARSE_MODEL)
+        self.vector_size     = self.embedder.get_sentence_embedding_dimension()
+        log.info(f"[Resources] Models loaded. Dense dim={self.vector_size}")
 
-    def _clear_stale_lock(self):
-        """Remove Qdrant's .lock file if no other FRIDAY/python process holds it."""
+    # ========================
+    # STEP 2 — Qdrant
+    # ========================
+
+    def _clear_stale_qdrant_lock(self) -> None:
+        """
+        Delete Qdrant's .lock file only if no other FRIDAY process holds it.
+        A stale lock is left behind when the process crashes unexpectedly.
+        """
         lock_file = os.path.join(QDRANT_PATH, ".lock")
         if not os.path.exists(lock_file):
             return
 
         current_pid = os.getpid()
-        other_python_running = False
         for proc in psutil.process_iter(["pid", "name", "cmdline"]):
             try:
                 if proc.info["pid"] == current_pid:
                     continue
                 pname = (proc.info["name"] or "").lower()
                 if "python" in pname:
-                    cmdline = proc.info.get("cmdline") or []
-                    cmd_str = " ".join(cmdline).lower()
+                    cmd_str = " ".join(proc.info.get("cmdline") or []).lower()
                     if "friday" in cmd_str or "main.py" in cmd_str:
-                        other_python_running = True
-                        break
+                        log.warning("[Resources] Another FRIDAY instance running — skipping lock clear")
+                        return
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
 
-        if other_python_running:
-            log.warning("[Memory] Another FRIDAY instance is running — cannot clear Qdrant lock")
+        try:
+            os.remove(lock_file)
+            log.info("[Resources] Removed stale Qdrant lock file")
+        except OSError as e:
+            log.warning(f"[Resources] Could not remove lock file: {e}")
+
+    def _setup_qdrant(self) -> None:
+        """
+        Connect to local Qdrant and ensure the memory collection exists.
+        Requires self.vector_size to already be set (from _load_models).
+        Runs in a thread — safe to call blocking Qdrant client methods.
+        """
+        from qdrant_client import QdrantClient
+        from qdrant_client.models import (
+            Distance, VectorParams, SparseVectorParams, SparseIndexParams
+        )
+        log.info("[Resources] Initializing Qdrant vector store...")
+
+        for attempt in range(2):
+            try:
+                self.qdrant = QdrantClient(path=QDRANT_PATH)
+                break
+            except Exception as e:
+                if attempt == 0 and "already running" in str(e).lower():
+                    log.warning("[Resources] Qdrant locked — attempting stale lock cleanup")
+                    self._clear_stale_qdrant_lock()
+                    continue
+                log.error(f"[Resources] Qdrant init failed: {e}")
+                log.warning("[Resources] Episodic memory DISABLED — FRIDAY will still work without it")
+                return
+
+        if self.qdrant is None:
             return
 
         try:
-            os.remove(lock_file)
-            log.info("[Memory] Removed stale Qdrant lock file")
-        except OSError as e:
-            log.warning(f"[Memory] Could not remove lock file: {e}")
+            existing = [c.name for c in self.qdrant.get_collections().collections]
+            if config.MEMORY_COLLECTION not in existing:
+                self.qdrant.create_collection(
+                    collection_name=config.MEMORY_COLLECTION,
+                    vectors_config={
+                        "dense": VectorParams(
+                            size=self.vector_size,
+                            distance=Distance.COSINE
+                        )
+                    },
+                    sparse_vectors_config={
+                        "sparse": SparseVectorParams(
+                            index=SparseIndexParams(on_disk=False)
+                        )
+                    }
+                )
+                log.info(f"[Resources] Created collection: {config.MEMORY_COLLECTION}")
+            else:
+                log.info(f"[Resources] Using existing collection: {config.MEMORY_COLLECTION}")
 
-    def _init_qdrant(self):
-        with self._lock:
-            if self._qdrant is not None:
-                return
-            from qdrant_client import QdrantClient
-            from qdrant_client.models import (
-                Distance, VectorParams, SparseVectorParams, SparseIndexParams
+            self.qdrant_available = True
+
+        except Exception as e:
+            log.error(f"[Resources] Collection setup failed: {e}")
+            self.qdrant = None
+            self.qdrant_available = False
+
+    # ========================
+    # STEP 3 — SQLite
+    # ========================
+
+    def _setup_sqlite(self) -> None:
+        """Create facts.db and ensure all required tables exist. Runs in a thread."""
+        log.info("[Resources] Initializing SQLite facts database...")
+        self.db = sqlite3.connect(SEMANTIC_DB, check_same_thread=False)
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS facts (
+                id         INTEGER PRIMARY KEY,
+                category   TEXT,
+                key        TEXT UNIQUE,
+                value      TEXT,
+                updated_at INTEGER
             )
-            log.info("[Memory] Initializing Qdrant vector store...")
-
-            for attempt in range(2):
-                try:
-                    self._qdrant = QdrantClient(path=QDRANT_PATH)
-                    break
-                except Exception as e:
-                    if attempt == 0 and "already running" in str(e).lower():
-                        log.warning(f"[Memory] Qdrant locked — attempting stale lock cleanup")
-                        self._clear_stale_lock()
-                        continue
-                    log.error(f"[Memory] Qdrant init failed: {e}")
-                    log.warning("[Memory] Episodic memory DISABLED — FRIDAY will still work without it")
-                    return
-
-            if self._qdrant is None:
-                return
-
-            try:
-                existing = [c.name for c in self._qdrant.get_collections().collections]
-                if config.MEMORY_COLLECTION not in existing:
-                    self._qdrant.create_collection(
-                        collection_name=config.MEMORY_COLLECTION,
-                        vectors_config={
-                            "dense": VectorParams(
-                                size=self.vector_size,
-                                distance=Distance.COSINE
-                            )
-                        },
-                        sparse_vectors_config={
-                            "sparse": SparseVectorParams(
-                                index=SparseIndexParams(on_disk=False)
-                            )
-                        }
-                    )
-                    log.info(f"[Memory] Created collection: {config.MEMORY_COLLECTION}")
-                else:
-                    log.info(f"[Memory] Using existing collection: {config.MEMORY_COLLECTION}")
-            except Exception as e:
-                log.error(f"[Memory] Collection setup failed: {e}")
-                self._qdrant = None
-
-    # --- SQLite ---
-
-    @property
-    def db(self):
-        if self._db is None:
-            self._init_db()
-        return self._db
-
-    @property
-    def db_lock(self):
-        return self._db_lock
-
-    def _init_db(self):
-        with self._lock:
-            if self._db is not None:
-                return
-            log.info("[Memory] Initializing SQLite facts database...")
-            self._db = sqlite3.connect(SEMANTIC_DB, check_same_thread=False)
-            self._db.execute("""CREATE TABLE IF NOT EXISTS facts (
-                id INTEGER PRIMARY KEY, category TEXT, key TEXT UNIQUE,
-                value TEXT, updated_at INTEGER
-            )""")
-            self._db.execute("""CREATE TABLE IF NOT EXISTS feedback (
-                id INTEGER PRIMARY KEY, query TEXT, context TEXT,
-                answer TEXT, was_useful INTEGER, timestamp INTEGER
-            )""")
-            self._db.execute("""CREATE TABLE IF NOT EXISTS user_profile (
+        """)
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS feedback (
+                id         INTEGER PRIMARY KEY,
+                query      TEXT,
+                context    TEXT,
+                answer     TEXT,
+                was_useful INTEGER,
+                timestamp  INTEGER
+            )
+        """)
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS user_profile (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
-            )""")
-            self._db.commit()
-            log.info("[Memory] SQLite ready.")
+            )
+        """)
+        self.db.commit()
+        log.info("[Resources] SQLite ready.")
 
-    def shutdown(self):
-        """Clean up resources on exit."""
-        with self._lock:
-            if self._qdrant:
-                self._qdrant.close()
-                self._qdrant = None
-            if self._db:
-                self._db.close()
-                self._db = None
+    # ========================
+    # SHUTDOWN
+    # ========================
 
-# Global instance
-_res = _LazyResources()
+    def shutdown(self) -> None:
+        """Close all connections cleanly. Called automatically on exit via atexit."""
+        if self.qdrant:
+            self.qdrant.close()
+            self.qdrant = None
+        if self.db:
+            self.db.close()
+            self.db = None
+        log.info("[Resources] Shutdown complete.")
+
+
+# ========================
+# GLOBAL INSTANCE
+# ========================
+# Import this wherever resources are needed:
+#   from memory.core.resources import _res, groq_client
+#
+# IMPORTANT: call `await _res.initialize()` once from main.py
+# before any memory operations are performed.
+
+_res = Resources()
 atexit.register(_res.shutdown)

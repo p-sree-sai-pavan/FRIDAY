@@ -100,15 +100,17 @@ async def _faithfulness_check(prompt: str, answer: str, context: str) -> float:
     Returns a score 0.0–1.0.
     < 0.5 → answer is unfaithful or off-topic → don't save to memory.
     >= 0.5 → save normally.
+    Uses get_client() so it works in both online and offline modes.
     """
-    from memory import groq_client
+    from core.model_client import get_client
 
     try:
-        resp = await groq_client.chat.completions.create(
+        client = get_client()
+        extra  = {"response_format": {"type": "json_object"}} if config.MODEL_MODE == "online" else {}
+        resp = await client.chat.completions.create(
             model=config.FAST_MODEL,
             temperature=0,
             max_tokens=10,
-            response_format={"type": "json_object"},
             messages=[{
                 "role": "user",
                 "content": (
@@ -118,9 +120,10 @@ async def _faithfulness_check(prompt: str, answer: str, context: str) -> float:
                     f"Answer: {answer[:300]}\n"
                     f"Reply ONLY with JSON: {{\"score\": 0.0-1.0}}"
                 )
-            }]
+            }],
+            **extra
         )
-        raw   = resp.choices[0].message.content
+        raw   = (resp.choices[0].message.content or "").strip().lstrip("```json").lstrip("```").rstrip("```").strip()
         score = json.loads(raw).get("score", 0.5)
         return float(score)
     except Exception as e:
