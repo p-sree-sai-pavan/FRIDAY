@@ -30,7 +30,7 @@ DDGS_TIMEOUT = 10   # seconds for ddgs sync call
 
 
 # ========================
-# TIER 1 — DuckDuckGo (free, no key)
+# TIER 2 — DuckDuckGo (free fallback, no key)
 # DDGS is sync, so we wrap in asyncio.to_thread
 # ========================
 
@@ -69,7 +69,7 @@ async def _search_ddgs(query: str) -> list[dict]:
 
 
 # ========================
-# TIER 2 — Tavily (free 1000 req/month, needs TAVILY_API_KEY)
+# TIER 1 — Tavily (best quality for RAG, 1000 req/month free)
 # Purpose-built for LLM/RAG — returns clean pre-extracted content
 # ========================
 

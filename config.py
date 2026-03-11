@@ -13,7 +13,7 @@ VERSION = "2.0.0"
 # ========================
 PRIMARY_MODEL  = "llama-3.3-70b-versatile"
 FAST_MODEL     = "llama-3.1-8b-instant"
-TOOLS_MODEL    = "llama3-groq-70b-8192-tool-use-preview"
+TOOLS_MODEL    = "llama-3.3-70b-versatile"
 VISION_MODEL   = "llama4-scout-17b-16e"
 FALLBACK_MODEL = "gemini-2.5-flash"
 TEMPERATURE = 0.45
@@ -56,10 +56,10 @@ VAD_SENSITIVITY = 0.5
 SILENCE_CHUNKS = 50
 
 # ========================
-# API KEYS
+# API KEYS (stripped to prevent whitespace issues)
 # ========================
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or "").strip() or None
+GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip() or None
 
 # ========================
 # GENERAL

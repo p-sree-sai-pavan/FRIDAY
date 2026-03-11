@@ -1,13 +1,18 @@
 """
 core/safety.py
 ===============
-FRIDAY Safety Layer — STUB
+FRIDAY Safety Layer
 
-Full implementation coming after tools are built.
-Currently auto-approves all actions so the system runs.
+Gates every tool execution by its RiskLevel.
+READ/WRITE → auto-execute
+SYSTEM     → ask Pavan first
+IRREVERSIBLE → always ask, no exceptions
 """
 
 from enum import Enum
+import logging
+
+log = logging.getLogger("safety")
 
 
 class Decision(Enum):
@@ -17,5 +22,23 @@ class Decision(Enum):
 
 
 async def check(tool, arguments: dict) -> Decision:
-    """Stub — approves everything. Replace with real logic later."""
-    return Decision.AUTO
+    from tools.registry import RiskLevel
+
+    if tool.risk == RiskLevel.READ:
+        return Decision.AUTO
+
+    if tool.risk == RiskLevel.WRITE:
+        log.info(f"[Safety] Auto-executing WRITE tool: {tool.name}")
+        return Decision.AUTO
+
+    if tool.risk == RiskLevel.SYSTEM:
+        log.warning(f"[Safety] SYSTEM tool requires confirmation: {tool.name}")
+        return Decision.ASK
+
+    if tool.risk == RiskLevel.IRREVERSIBLE:
+        log.warning(f"[Safety] IRREVERSIBLE tool requires confirmation: {tool.name}")
+        return Decision.ASK
+
+    # Unknown risk level — deny by default
+    log.error(f"[Safety] Unknown risk level for {tool.name} — denying.")
+    return Decision.DENY
